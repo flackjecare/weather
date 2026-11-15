@@ -1,16 +1,19 @@
 -- ============================================================
 -- Weather renderer
--- Modes: "Rain" | "Snow" | "Thunder"
+-- Modes: "Rain" | "Snow" | "Thunder" | "Fireflies"
 -- Features:
 --   * Raycasted ground detection and per-frame collision for every drop/flake
 --   * Per-drop variable fall speed and variable spawn height
 --   * Circular splashes projected onto the impact surface (not a 2D overlay)
 --   * Splashes are occlusion-tested so they no longer show through walls
 --   * Snow uses the same raycasted collision system as rain
---   * Thunder mode: multiplied rain count, faster rain, and jagged fading
+--   * Thunder mode: multiplied rain count, faster rain, jagged fading
 --     thunderbolts with optional branches + screen flash
 --   * Drops/flakes fall through invisible parts (Transparency >= 1)
 --   * Behind-camera culling via WorldToScreen onScreen return value
+--   * Random gusts that temporarily shift direction, speed and rain count
+--   * Fireflies mode: wandering glowing dots with soft pulsing blink
+--   * Intensity presets (Light / Medium / Heavy / Storm) applied via menu
 --   * Configurable at runtime via the Matcha menu (UI.AddTab)
 -- ============================================================
 
@@ -27,7 +30,7 @@ if _G.WeatherCleanup then pcall(_G.WeatherCleanup) end
 -- ============================================================
 local Config = {
     Enabled = true,
-    Mode    = "Rain",  -- "Rain" | "Snow" | "Thunder"
+    Mode    = "Rain",  -- "Rain" | "Snow" | "Thunder" | "Fireflies"
 
     -- Rain
     RAIN_COUNT       = 60,
@@ -74,6 +77,25 @@ local Config = {
     THUNDER_FLASH_DURATION      = 0.25,
     THUNDER_FLASH_MAX_ALPHA     = 0.35,
 
+    -- Gusts (wind events that temporarily shift particle behaviour)
+    GUST_ENABLED       = true,
+    GUST_AFFECTS_COUNT = true,   -- only rain count is affected by gusts
+    GUST_MIN_INTERVAL  = 8.0,
+    GUST_MAX_INTERVAL  = 25.0,
+    GUST_MIN_DURATION  = 2.0,
+    GUST_MAX_DURATION  = 6.0,
+    GUST_DIRECTION_X   = 15.0,   -- max extra angle X added during a gust
+    GUST_DIRECTION_Z   = 15.0,   -- max extra angle Z added during a gust
+    GUST_SPEED_MULT    = 1.8,
+    GUST_COUNT_MULT    = 1.5,    -- rain count multiplier during a gust
+    GUST_FADE_DURATION = 1.0,    -- seconds to ramp gust intensity in/out
+
+    -- Fireflies
+    FIREFLY_COUNT       = 30,
+    FIREFLY_RADIUS      = 80,
+    FIREFLY_HEIGHT_RANGE = 30,   -- +/- around player Y
+    FIREFLY_DRIFT       = 2.0,
+
     -- Render
     MAX_RENDER_DISTANCE = 400,
 }
@@ -93,12 +115,24 @@ local PI3 = math.pi / 3.0
 -- ============================================================
 local drops             = {}
 local s_flakes          = {}
+local fireflies         = {}
 local activeBolts       = {}
 local nextBoltTimer     = 0
 local flashSquare       = nil
 local flashAge          = -1
 local lastCharacter     = nil
 local cleanupConnection
+
+-- Gust state (live, mutated by updateGust each frame)
+local gustActive        = false
+local gustTimer         = 0
+local gustNextTimer     = 0
+local gustElapsed       = 0
+local gustIntensity     = 0
+local gustDirX          = 0
+local gustDirZ          = 0
+local gustSpeedMul      = 1.0
+local gustCountMul      = 1.0
 
 -- ============================================================
 -- Drawing object pool (Line / Circle / Triangle)
@@ -174,9 +208,15 @@ _G.WeatherCleanup = function()
     TriPool     = {}
     drops       = {}
     s_flakes    = {}
+    fireflies   = {}
     activeBolts = {}
     flashSquare = nil
     flashAge    = -1
+    gustActive  = false
+    gustTimer   = 0
+    gustNextTimer = 0
+    gustElapsed   = 0
+    gustIntensity = 0
 end
 
 -- ============================================================
@@ -284,6 +324,7 @@ local COL_SNOW_LAND = Color3.fromRGB(210, 228, 255)
 local COL_RAIN      = Color3.fromRGB(140, 145, 220)
 local COL_SPLASH    = Color3.fromRGB(170, 195, 240)
 local COL_BOLT_CORE = Color3.fromRGB(255, 255, 255)
+local COL_FIREFLY_CORE = Color3.fromRGB(255, 255, 200)
 
 -- ============================================================
 -- Drawing helpers
@@ -313,7 +354,9 @@ local function drawFilledGroundEllipse(cx, cy, rx, ry, col, transparency)
     t2.Visible = true
 end
 
--- Six-arm snowflake shape with side branches and a bright core
+-- Six-arm snowflake shape with side branches and a bright core.
+-- Filled is set explicitly on the core circle so pool reuse by fireflies
+-- (which use Filled = true) doesn't corrupt the snowflake's outline look.
 local function drawSnowflakeShape(cx, cy, r, angle, alpha)
     -- 3 diameter lines form all 6 main arms in half the draw calls
     for i = 0, 2 do
@@ -351,6 +394,7 @@ local function drawSnowflakeShape(cx, cy, r, angle, alpha)
     end
 
     local core = getCircle()
+    core.Filled = false
     core.Position = Vector2.new(cx, cy)
     core.Radius = math.max(1.0, r * 0.22)
     core.Color = COL_SNOW_CORE
@@ -384,6 +428,120 @@ local function drawBoltSegment(p1, p2, color, coreThick, glowThick, alpha, camer
     core.Transparency = 1 - alpha
     core.Thickness = coreThick
     core.Visible = true
+end
+
+-- ============================================================
+-- Presets (applied live via the Matcha "Preset" combo)
+-- ============================================================
+
+-- Maps widget id -> Config key, so applyPreset can update both the Config
+-- value and the slider position in one go.
+local WidgetToConfig = {
+    wt_rcount = "RAIN_COUNT",          wt_rrad   = "RAIN_RADIUS",
+    wt_rhmin  = "RAIN_HEIGHT_MIN",     wt_rhmax  = "RAIN_HEIGHT_MAX",
+    wt_rsmin  = "RAIN_SPEED_MIN",      wt_rsmax  = "RAIN_SPEED_MAX",
+    wt_rbspd  = "RAIN_BASE_SPEED",     wt_rlen   = "RAIN_LENGTH",
+    wt_rangx  = "RAIN_ANGLE_X",        wt_rangz  = "RAIN_ANGLE_Z",
+    wt_spdur  = "SPLASH_DURATION",     wt_spsize = "SPLASH_SIZE",
+    wt_spseg  = "SPLASH_SEGMENTS",
+    wt_scount = "SNOW_COUNT",          wt_srad   = "SNOW_RADIUS",
+    wt_sspd   = "SNOW_SPEED",          wt_shmin  = "SNOW_HEIGHT_MIN",
+    wt_shmax  = "SNOW_HEIGHT_MAX",     wt_sdrift = "SNOW_DRIFT",
+}
+
+-- Each preset is a {widget_id = value} table. Rain + snow + splash are covered;
+-- thunder/firefly/gust settings are left untouched (tweak those separately).
+local Presets = {
+    Light = {
+        wt_rcount = 20,  wt_rrad = 40,  wt_rhmin = 20, wt_rhmax = 80,
+        wt_rsmin  = 20,  wt_rsmax = 35, wt_rbspd = 40, wt_rlen = 1.5,
+        wt_rangx  = 0.5, wt_rangz = 1.5,
+        wt_spdur  = 0.3, wt_spsize = 0.7, wt_spseg = 5,
+        wt_scount = 50,  wt_srad = 120, wt_sspd = 8,
+        wt_shmin  = 15,  wt_shmax = 60, wt_sdrift = 0.2,
+    },
+    Medium = {
+        wt_rcount = 60,  wt_rrad = 60,  wt_rhmin = 30, wt_rhmax = 120,
+        wt_rsmin  = 45,  wt_rsmax = 75, wt_rbspd = 60, wt_rlen = 2,
+        wt_rangx  = 1,   wt_rangz = 3,
+        wt_spdur  = 0.45, wt_spsize = 1, wt_spseg = 6,
+        wt_scount = 150, wt_srad = 180, wt_sspd = 14,
+        wt_shmin  = 20,  wt_shmax = 80, wt_sdrift = 0.4,
+    },
+    Heavy = {
+        wt_rcount = 150, wt_rrad = 100, wt_rhmin = 40, wt_rhmax = 160,
+        wt_rsmin  = 60,  wt_rsmax = 100, wt_rbspd = 80, wt_rlen = 3,
+        wt_rangx  = 3,   wt_rangz = 6,
+        wt_spdur  = 0.6, wt_spsize = 1.5, wt_spseg = 8,
+        wt_scount = 300, wt_srad = 220, wt_sspd = 20,
+        wt_shmin  = 30,  wt_shmax = 120, wt_sdrift = 0.8,
+    },
+    Storm = {
+        wt_rcount = 250, wt_rrad = 140, wt_rhmin = 50, wt_rhmax = 200,
+        wt_rsmin  = 80,  wt_rsmax = 130, wt_rbspd = 100, wt_rlen = 4,
+        wt_rangx  = 5,   wt_rangz = 10,
+        wt_spdur  = 0.8, wt_spsize = 2, wt_spseg = 10,
+        wt_scount = 400, wt_srad = 260, wt_sspd = 28,
+        wt_shmin  = 40,  wt_shmax = 150, wt_sdrift = 1.2,
+    },
+}
+
+local function applyPreset(name)
+    local p = Presets[name]
+    if not p then return end
+    for widgetId, val in pairs(p) do
+        local configKey = WidgetToConfig[widgetId]
+        if configKey then
+            Config[configKey] = val
+        end
+        pcall(function() UI.SetValue(widgetId, val) end)
+    end
+end
+
+-- ============================================================
+-- Gust state machine
+-- ============================================================
+local function updateGust(dt)
+    if not Config.GUST_ENABLED then
+        gustActive = false
+        gustTimer = 0
+        gustElapsed = 0
+        gustIntensity = 0
+        return
+    end
+
+    if gustActive then
+        gustElapsed = gustElapsed + dt
+        gustTimer = gustTimer - dt
+        if gustTimer <= 0 then
+            gustActive = false
+            gustIntensity = 0
+            gustElapsed = 0
+            gustNextTimer = randf(Config.GUST_MIN_INTERVAL, Config.GUST_MAX_INTERVAL)
+        else
+            -- Smooth ramp: intensity goes 0->1 over the fade-in seconds at the
+            -- start, holds at 1 in the middle, then 1->0 over the fade-out
+            -- seconds at the end. This makes gusts ease in and out instead of
+            -- snapping on/off.
+            local fade = Config.GUST_FADE_DURATION
+            if fade < 0.01 then fade = 0.01 end
+            local fadeInFrac  = math.min(1.0, gustElapsed / fade)
+            local fadeOutFrac = math.min(1.0, gustTimer / fade)
+            gustIntensity = math.min(fadeInFrac, fadeOutFrac)
+        end
+    else
+        gustNextTimer = gustNextTimer - dt
+        if gustNextTimer <= 0 then
+            -- Start a new gust with randomized parameters
+            gustActive = true
+            gustTimer = randf(Config.GUST_MIN_DURATION, Config.GUST_MAX_DURATION)
+            gustElapsed = 0
+            gustDirX = randf(-Config.GUST_DIRECTION_X, Config.GUST_DIRECTION_X)
+            gustDirZ = randf(-Config.GUST_DIRECTION_Z, Config.GUST_DIRECTION_Z)
+            gustSpeedMul = randf(1.0, Config.GUST_SPEED_MULT)
+            gustCountMul = randf(1.0, Config.GUST_COUNT_MULT)
+        end
+    end
 end
 
 -- ============================================================
@@ -442,16 +600,30 @@ end
 local function tickSnow(dt, camPos, camera)
     local maxRenderSqr = Config.MAX_RENDER_DISTANCE * Config.MAX_RENDER_DISTANCE
 
+    -- Gust influence on snow: speed multiplier + horizontal drift push.
+    -- Scaled by gustIntensity for smooth ramp in/out.
+    -- Count is NOT affected by gusts for snow (per design).
+    local gi = gustIntensity
+    local snowSpeedMul = 1.0 + (gustSpeedMul - 1.0) * gi
+    local gustDriftX = 0
+    local gustDriftZ = 0
+    if gi > 0 then
+        local gustStrength = (gustSpeedMul - 1.0) * 8 * gi
+        gustDriftX = math.tan(math.rad(gustDirX)) * gustStrength
+        gustDriftZ = math.tan(math.rad(gustDirZ)) * gustStrength
+    end
+
     for _, f in ipairs(s_flakes) do
         if not f.Position then
             spawnFlake(f)
         else
             -- ===== Movement =====
             if not f.Landed then
+                local fallSpeed = Config.SNOW_SPEED * f.SpeedMul * snowSpeedMul
                 local movement = Vector3.new(
-                    f.DriftX * dt,
-                    -Config.SNOW_SPEED * f.SpeedMul * dt,
-                    f.DriftZ * dt
+                    (f.DriftX + gustDriftX) * dt,
+                    -fallSpeed * dt,
+                    (f.DriftZ + gustDriftZ) * dt
                 )
 
                 local aboveGround = f.GroundY
@@ -536,6 +708,7 @@ local function tickSnow(dt, camPos, camera)
                                     drawSnowflakeShape(sc.X, sc.Y, screen_r, f.Spin, alpha)
                                 else
                                     local c = getCircle()
+                                    c.Filled = false
                                     c.Position = sc
                                     c.Radius = screen_r
                                     c.Color = COL_SNOW_ARM
@@ -561,18 +734,48 @@ local function spawnPosition()
     if not root then return nil, nil end
 
     local center = root.Position
+
+    -- Compute the effective rain direction at spawn time (including gust
+    -- offset) so we can shift the spawn point upwind. Without this shift,
+    -- angled rain spawns directly above the player and drifts sideways,
+    -- missing the centre entirely. We offset the spawn XZ backwards along
+    -- the horizontal direction so the angled trajectory passes over the
+    -- intended target area.
+    local angleX = Config.RAIN_ANGLE_X
+    local angleZ = Config.RAIN_ANGLE_Z
+    if gustIntensity > 0 then
+        angleX = angleX + gustDirX * gustIntensity
+        angleZ = angleZ + gustDirZ * gustIntensity
+    end
+    local rainDir = Vector3.new(
+        math.tan(math.rad(angleX)),
+        -1,
+        math.tan(math.rad(angleZ))
+    ).Unit
+    local dyAbs = math.abs(rainDir.Y)
+    if dyAbs < 0.01 then dyAbs = 0.01 end
+
+    -- Target XZ: where we want the drop to land (random point around player)
     local angle  = math.random() * math.pi * 2
     local radius = math.sqrt(math.random()) * Config.RAIN_RADIUS
-
-    local x = center.X + math.cos(angle) * radius
-    local z = center.Z + math.sin(angle) * radius
-
-    local ground  = getGround(x, z, center.Y)
-    local groundY = ground and ground.Position.Y or center.Y
+    local targetX = center.X + math.cos(angle) * radius
+    local targetZ = center.Z + math.sin(angle) * radius
 
     -- Variable spawn height
     local spawnH = randf(Config.RAIN_HEIGHT_MIN, Config.RAIN_HEIGHT_MAX)
-    return Vector3.new(x, groundY + spawnH, z), groundY
+
+    -- Horizontal distance the drop travels while falling spawnH studs down:
+    --   horizontalTravel = (rainDir.XZ / |rainDir.Y|) * spawnH
+    -- Shift the spawn point backwards by that amount so the drop's angled
+    -- path brings it back over the target by the time it reaches the ground.
+    local offsetDist = spawnH / dyAbs
+    local spawnX = targetX - rainDir.X * offsetDist
+    local spawnZ = targetZ - rainDir.Z * offsetDist
+
+    local ground  = getGround(spawnX, spawnZ, center.Y)
+    local groundY = ground and ground.Position.Y or center.Y
+
+    return Vector3.new(spawnX, groundY + spawnH, spawnZ), groundY
 end
 
 local function createDrop()
@@ -701,14 +904,21 @@ local function tickRain(dt, camPos, camera)
         end
     end
 
-    -- Recompute rain direction each frame (angles can change via the menu)
+    -- Recompute rain direction each frame (angles can change via the menu,
+    -- and a live gust adds an extra angle offset + speed multiplier).
+    -- Gust effects are scaled by gustIntensity for smooth ramp in/out.
+    local gi = gustIntensity
+    local angleX = Config.RAIN_ANGLE_X + gustDirX * gi
+    local angleZ = Config.RAIN_ANGLE_Z + gustDirZ * gi
+    local speedMul = (Config.Mode == "Thunder") and Config.THUNDER_SPEED_MULT or 1.0
+    speedMul = speedMul * (1.0 + (gustSpeedMul - 1.0) * gi)
+
     local rainDir = Vector3.new(
-        math.tan(math.rad(Config.RAIN_ANGLE_X)),
+        math.tan(math.rad(angleX)),
         -1,
-        math.tan(math.rad(Config.RAIN_ANGLE_Z))
+        math.tan(math.rad(angleZ))
     ).Unit
     local rainOffset = rainDir * Config.RAIN_LENGTH
-    local speedMult  = (Config.Mode == "Thunder") and Config.THUNDER_SPEED_MULT or 1.0
     local maxRenderSqr = Config.MAX_RENDER_DISTANCE * Config.MAX_RENDER_DISTANCE
 
     for _, drop in ipairs(drops) do
@@ -724,8 +934,8 @@ local function tickRain(dt, camPos, camera)
             local dz = drop.Position.Z - camPos.Z
             local distSqr = dx*dx + dy*dy + dz*dz
 
-            -- Per-drop variable fall speed, scaled by mode multiplier
-            local movement = rainDir * (Config.RAIN_BASE_SPEED * drop.SpeedMul * speedMult * dt)
+            -- Per-drop variable fall speed, scaled by mode multiplier + gust
+            local movement = rainDir * (Config.RAIN_BASE_SPEED * drop.SpeedMul * speedMul * dt)
 
             local aboveGround = drop.GroundY
                 and (drop.Position.Y - drop.GroundY) > GROUND_CHECK_THRESHOLD
@@ -993,6 +1203,136 @@ local function tickThunder(dt, camPos, camera)
 end
 
 -- ============================================================
+-- Fireflies system
+-- ============================================================
+local function createFirefly()
+    return {
+        Position      = nil,
+        Vel           = Vector3.new(0, 0, 0),
+        TargetVel     = Vector3.new(0, 0, 0),
+        WanderTimer   = randf(2, 5),
+        BlinkPhase    = math.random() * math.pi * 2,
+        BlinkSpeed    = randf(0.5, 2.0),
+        Size          = randf(0.14, 0.40),
+        Color         = Color3.fromRGB(180 + math.random(0, 50),
+                                       230 + math.random(0, 25),
+                                       80 + math.random(0, 50)),
+        CachedOccluded = false,
+        OcclusionTimer = math.random() * SNOW_OCCLUSION_INTERVAL,
+    }
+end
+
+local function spawnFirefly(f)
+    local character = player.Character
+    local root = character and character:FindFirstChild("HumanoidRootPart")
+    if not root then return end
+
+    local center = root.Position
+    local angle  = math.random() * math.pi * 2
+    local radius = math.sqrt(math.random()) * Config.FIREFLY_RADIUS
+
+    local x = center.X + math.cos(angle) * radius
+    local z = center.Z + math.sin(angle) * radius
+    local y = center.Y + randf(-Config.FIREFLY_HEIGHT_RANGE, Config.FIREFLY_HEIGHT_RANGE)
+
+    f.Position    = Vector3.new(x, y, z)
+    f.Vel         = Vector3.new(randf(-1, 1), randf(-0.5, 0.5), randf(-1, 1))
+    f.TargetVel   = f.Vel
+    f.WanderTimer = randf(2, 5)
+    f.BlinkPhase  = math.random() * math.pi * 2
+    f.BlinkSpeed  = randf(0.5, 2.0)
+    f.Size        = randf(0.14, 0.40)
+    f.Color       = Color3.fromRGB(180 + math.random(0, 50),
+                                   230 + math.random(0, 25),
+                                   80 + math.random(0, 50))
+    f.CachedOccluded = false
+    f.OcclusionTimer = math.random() * SNOW_OCCLUSION_INTERVAL
+end
+
+local function tickFireflies(dt, camPos, camera)
+    local playerPos = getPlayerPos()
+    if not playerPos then return end
+
+    local maxRenderSqr = Config.MAX_RENDER_DISTANCE * Config.MAX_RENDER_DISTANCE
+    local radiusSqr = Config.FIREFLY_RADIUS * Config.FIREFLY_RADIUS
+
+    for _, f in ipairs(fireflies) do
+        if not f.Position then
+            spawnFirefly(f)
+        else
+            -- ===== Wandering motion =====
+            -- Periodically pick a new target velocity, then lerp current velocity
+            -- toward it for smooth organic drift.
+            f.WanderTimer = f.WanderTimer - dt
+            if f.WanderTimer <= 0 then
+                f.WanderTimer = randf(2, 5)
+                f.TargetVel = Vector3.new(
+                    randf(-Config.FIREFLY_DRIFT, Config.FIREFLY_DRIFT),
+                    randf(-Config.FIREFLY_DRIFT * 0.3, Config.FIREFLY_DRIFT * 0.3),
+                    randf(-Config.FIREFLY_DRIFT, Config.FIREFLY_DRIFT)
+                )
+            end
+
+            local lerpAlpha = math.min(1, dt * 1.5)
+            f.Vel = f.Vel:Lerp(f.TargetVel, lerpAlpha)
+            f.Position = f.Position + f.Vel * dt
+
+            -- Keep fireflies within the radius around the player; respawn if
+            -- they stray too far horizontally or vertically.
+            local dx = f.Position.X - playerPos.X
+            local dz = f.Position.Z - playerPos.Z
+            local dy = f.Position.Y - playerPos.Y
+            if (dx*dx + dz*dz) > radiusSqr or math.abs(dy) > Config.FIREFLY_HEIGHT_RANGE * 1.5 then
+                spawnFirefly(f)
+            else
+                -- ===== Blink =====
+                f.BlinkPhase = f.BlinkPhase + f.BlinkSpeed * dt
+
+                -- ===== Render =====
+                local rdx = f.Position.X - camPos.X
+                local rdy = f.Position.Y - camPos.Y
+                local rdz = f.Position.Z - camPos.Z
+                local distSqr = rdx*rdx + rdy*rdy + rdz*rdz
+
+                if distSqr <= maxRenderSqr then
+                    -- Staggered occlusion test
+                    f.OcclusionTimer = f.OcclusionTimer - dt
+                    if f.OcclusionTimer <= 0 then
+                        f.OcclusionTimer = SNOW_OCCLUSION_INTERVAL
+                        f.CachedOccluded = isOccluded(f.Position, camera)
+                    end
+
+                    if not f.CachedOccluded then
+                        local sc, onScreen = WorldToScreen(f.Position)
+                        if onScreen then  -- behind-camera cull
+                            local dist = math.sqrt(distSqr)
+                            -- Same sizing formula as snow so fireflies are tiny dots
+                            local screen_r = math.clamp(f.Size * 110.0 / (dist + 0.5), 1.0, 13.0)
+
+                            -- Smooth pulse: brightness ranges from 0.2 (faint)
+                            -- to 1.0 (full), so the dot is always faintly visible
+                            -- but clearly pulses.
+                            local raw = (math.sin(f.BlinkPhase) + 1) * 0.5  -- 0..1
+                            local brightness = 0.2 + raw * 0.8
+
+                            -- Single pulsing core dot (no glow halo)
+                            local core = getCircle()
+                            core.Filled = true
+                            core.Position = sc
+                            core.Radius = screen_r
+                            core.Color = f.Color
+                            core.Transparency = 1 - brightness
+                            core.Thickness = 1
+                            core.Visible = true
+                        end
+                    end
+                end
+            end
+        end
+    end
+end
+
+-- ============================================================
 -- Table management (live mode/count switching)
 -- ============================================================
 local function clearDrops()
@@ -1004,6 +1344,10 @@ end
 
 local function clearFlakes()
     s_flakes = {}
+end
+
+local function clearFireflies()
+    fireflies = {}
 end
 
 local function ensureDropsCount(target)
@@ -1035,6 +1379,19 @@ local function ensureFlakesCount(target)
     end
 end
 
+local function ensureFirefliesCount(target)
+    local cur = #fireflies
+    if cur < target then
+        for i = cur + 1, target do
+            fireflies[i] = createFirefly()
+        end
+    elseif cur > target then
+        for i = cur, target + 1, -1 do
+            fireflies[i] = nil
+        end
+    end
+end
+
 -- ============================================================
 -- Matcha menu (UI.AddTab callback runs every frame; widgets dedupe by id)
 -- ============================================================
@@ -1044,11 +1401,14 @@ pcall(function()
         -- ===== General (Left) =====
         local gen = tab:Section("General", "Left")
         gen:Toggle("wt_en", "Enabled", true, function(v) Config.Enabled = v end)
-        gen:Combo("wt_mode", "Mode", {"Rain", "Snow", "Thunder"}, 0, function(idx, text)
+        gen:Combo("wt_mode", "Mode", {"Rain", "Snow", "Thunder", "Fireflies"}, 0, function(idx, text)
             Config.Mode = text
             if text == "Thunder" then
                 nextBoltTimer = randf(Config.THUNDER_BOLT_MIN_INTERVAL, Config.THUNDER_BOLT_MAX_INTERVAL)
             end
+        end)
+        gen:Combo("wt_preset", "Preset", {"Custom", "Light", "Medium", "Heavy", "Storm"}, 0, function(idx, text)
+            if text ~= "Custom" then applyPreset(text) end
         end)
         gen:SliderInt("wt_mrd", "Max Render Distance", 50, 2000, 400, function(v)
             Config.MAX_RENDER_DISTANCE = v
@@ -1074,6 +1434,13 @@ pcall(function()
         spl:SliderFloat("wt_spsize", "Size", 0.1, 5.0, 1, "%.1f", function(v) Config.SPLASH_SIZE = v end)
         spl:SliderInt("wt_spseg", "Segments", 3, 32, 6, function(v) Config.SPLASH_SEGMENTS = v end)
 
+        -- ===== Fireflies (Left) =====
+        local ff = tab:Section("Fireflies", "Left")
+        ff:SliderInt("wt_ffcount", "Count", 5, 200, 60, function(v) Config.FIREFLY_COUNT = v end)
+        ff:SliderInt("wt_ffrad", "Radius", 10, 300, 60, function(v) Config.FIREFLY_RADIUS = v end)
+        ff:SliderFloat("wt_ffh", "Height Range", 5, 100, 30, "%.1f", function(v) Config.FIREFLY_HEIGHT_RANGE = v end)
+        ff:SliderFloat("wt_ffd", "Drift", 0, 10, 2, "%.1f", function(v) Config.FIREFLY_DRIFT = v end)
+
         -- ===== Snow (Right) =====
         local snow = tab:Section("Snow", "Right")
         snow:SliderInt("wt_scount", "Count", 10, 400, 150, function(v) Config.SNOW_COUNT = v end)
@@ -1084,6 +1451,20 @@ pcall(function()
         snow:SliderFloat("wt_sdrift", "Drift", 0, 3, 0.4, "%.1f", function(v) Config.SNOW_DRIFT = v end)
         snow:SliderFloat("wt_slmin", "Land Dur Min", 0.1, 3.0, 0.5, "%.1f", function(v) Config.SNOW_LAND_DURATION_MIN = v end)
         snow:SliderFloat("wt_slmax", "Land Dur Max", 0.5, 5.0, 2.0, "%.1f", function(v) Config.SNOW_LAND_DURATION_MAX = v end)
+
+        -- ===== Gusts (Right) =====
+        local gust = tab:Section("Gusts", "Right")
+        gust:Toggle("wt_gen", "Enabled", true, function(v) Config.GUST_ENABLED = v end)
+        gust:Toggle("wt_gac", "Affect Rain Count", true, function(v) Config.GUST_AFFECTS_COUNT = v end)
+        gust:SliderFloat("wt_gmin", "Min Interval", 1, 60, 8, "%.1f", function(v) Config.GUST_MIN_INTERVAL = v end)
+        gust:SliderFloat("wt_gmax", "Max Interval", 5, 120, 25, "%.1f", function(v) Config.GUST_MAX_INTERVAL = v end)
+        gust:SliderFloat("wt_gdmin", "Min Duration", 0.5, 10, 2, "%.1f", function(v) Config.GUST_MIN_DURATION = v end)
+        gust:SliderFloat("wt_gdmax", "Max Duration", 1, 20, 6, "%.1f", function(v) Config.GUST_MAX_DURATION = v end)
+        gust:SliderFloat("wt_gdx", "Direction X", 0, 45, 15, "%.1f", function(v) Config.GUST_DIRECTION_X = v end)
+        gust:SliderFloat("wt_gdz", "Direction Z", 0, 45, 15, "%.1f", function(v) Config.GUST_DIRECTION_Z = v end)
+        gust:SliderFloat("wt_gsm", "Speed Mult", 1, 5, 1.8, "%.1f", function(v) Config.GUST_SPEED_MULT = v end)
+        gust:SliderFloat("wt_gcm", "Count Mult", 1, 5, 1.5, "%.1f", function(v) Config.GUST_COUNT_MULT = v end)
+        gust:SliderFloat("wt_gfd", "Fade Duration", 0.1, 5.0, 1.0, "%.1f", function(v) Config.GUST_FADE_DURATION = v end)
 
         -- ===== Thunder (Right) =====
         local thun = tab:Section("Thunder", "Right")
@@ -1109,11 +1490,14 @@ end)
 -- Initialize
 -- ============================================================
 nextBoltTimer = randf(Config.THUNDER_BOLT_MIN_INTERVAL, Config.THUNDER_BOLT_MAX_INTERVAL)
+gustNextTimer = randf(Config.GUST_MIN_INTERVAL, Config.GUST_MAX_INTERVAL)
 
 -- Pre-allocate whichever table the starting mode needs
 if Config.Mode == "Snow" then
     ensureFlakesCount(Config.SNOW_COUNT)
-else
+elseif Config.Mode == "Fireflies" then
+    ensureFirefliesCount(Config.FIREFLY_COUNT)
+else  -- Rain or Thunder
     local startCount = Config.RAIN_COUNT
     if Config.Mode == "Thunder" then
         startCount = math.floor(Config.RAIN_COUNT * Config.THUNDER_COUNT_MULT)
@@ -1149,6 +1533,9 @@ cleanupConnection = RunService.RenderStepped:Connect(function(dt)
     local camPos = camera.CFrame.Position
     local clampedDt = math.min(dt or 0.016, 0.1)
 
+    -- Update gust state every frame (affects rain + snow, harmless in other modes)
+    updateGust(clampedDt)
+
     -- Tear down thunder-only state when not in thunder mode
     if Config.Mode ~= "Thunder" then
         if #activeBolts > 0 then activeBolts = {} end
@@ -1158,14 +1545,26 @@ cleanupConnection = RunService.RenderStepped:Connect(function(dt)
 
     if Config.Mode == "Snow" then
         if #drops > 0 then clearDrops() end
+        if #fireflies > 0 then clearFireflies() end
         ensureFlakesCount(Config.SNOW_COUNT)
         tickSnow(clampedDt, camPos, camera)
-    else
-        -- Rain or Thunder
+    elseif Config.Mode == "Fireflies" then
+        if #drops > 0 then clearDrops() end
         if #s_flakes > 0 then clearFlakes() end
+        ensureFirefliesCount(Config.FIREFLY_COUNT)
+        tickFireflies(clampedDt, camPos, camera)
+    else  -- Rain or Thunder
+        if #s_flakes > 0 then clearFlakes() end
+        if #fireflies > 0 then clearFireflies() end
         local rainCount = Config.RAIN_COUNT
         if Config.Mode == "Thunder" then
-            rainCount = math.floor(Config.RAIN_COUNT * Config.THUNDER_COUNT_MULT)
+            rainCount = math.floor(rainCount * Config.THUNDER_COUNT_MULT)
+        end
+        -- Gusts can temporarily boost rain count (toggleable), scaled by
+        -- gustIntensity for smooth ramp in/out.
+        if Config.GUST_AFFECTS_COUNT and gustIntensity > 0 then
+            local effCountMul = 1.0 + (gustCountMul - 1.0) * gustIntensity
+            rainCount = math.floor(rainCount * effCountMul)
         end
         ensureDropsCount(rainCount)
         if Config.Mode == "Thunder" then
