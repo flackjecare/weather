@@ -1,0 +1,980 @@
+-- ============================================================
+-- Weather renderer
+-- Modes: "Rain" | "Snow" | "Thunder"
+-- Features:
+--   * Raycasted ground detection and per-frame collision for every drop/flake
+--   * Per-drop variable fall speed and variable spawn height
+--   * Circular splashes projected onto the impact surface (not a 2D overlay)
+--   * Splashes are occlusion-tested so they no longer show through walls
+--   * Snow uses the same raycasted collision system as rain
+--   * Thunder mode: doubled rain count, faster rain, and jagged fading
+--     thunderbolts with optional branches + screen flash
+-- ============================================================
+
+local Players    = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local Workspace  = game:GetService("Workspace")
+
+local player = Players.LocalPlayer
+
+if _G.WeatherCleanup then pcall(_G.WeatherCleanup) end
+
+-- ============================================================
+-- Settings
+-- ============================================================
+local Mode = "Rain"  -- "Rain" | "Snow" | "Thunder"
+
+-- Rain
+local RAIN_COUNT       = 60
+local RAIN_RADIUS      = 60
+local RAIN_HEIGHT_MIN  = 30
+local RAIN_HEIGHT_MAX  = 120
+local RAIN_SPEED_MIN   = 45
+local RAIN_SPEED_MAX   = 75
+local RAIN_BASE_SPEED  = 60
+local RAIN_LENGTH      = 2
+local VOID_Y           = -100
+
+local SPLASH_ENABLED   = true
+local SPLASH_DURATION  = 0.45
+local SPLASH_SIZE      = 1
+local SPLASH_SEGMENTS  = 6
+
+local RAIN_ANGLE_X = 1
+local RAIN_ANGLE_Z = 3
+
+-- Thunder
+local THUNDER_COUNT_MULT          = 1.5
+local THUNDER_SPEED_MULT          = 1.5
+local THUNDER_BOLT_MIN_INTERVAL   = 4.0
+local THUNDER_BOLT_MAX_INTERVAL   = 12.0
+local THUNDER_BOLT_FADE_IN        = 0.06
+local THUNDER_BOLT_FADE_OUT       = 0.35
+local THUNDER_BOLT_SEGMENTS       = 12
+local THUNDER_BOLT_JITTER         = 6.0
+local THUNDER_BOLT_HEIGHT         = 200
+local THUNDER_BOLT_RADIUS         = 120
+local THUNDER_BOLT_BRANCH_CHANCE  = 0.75
+local THUNDER_BOLT_MAX_BRANCHES   = 3
+local THUNDER_FLASH_ENABLED       = false
+local THUNDER_FLASH_DURATION      = 0.25
+local THUNDER_FLASH_MAX_ALPHA     = 0.35
+
+-- Snow
+local SNOW_COUNT       = 150
+local SNOW_RADIUS      = 180
+local SNOW_SPEED       = 14.0
+local SNOW_HEIGHT_MIN  = 20
+local SNOW_HEIGHT_MAX  = 80
+local SNOW_DRIFT       = 0.4
+local SNOW_LAND_DURATION_MIN = 0.5
+local SNOW_LAND_DURATION_MAX = 2.0
+
+-- Performance tuning
+local GROUND_CHECK_THRESHOLD   = 30
+local OCCLUSION_INTERVAL       = 0.03
+local SNOW_OCCLUSION_INTERVAL  = 0.10
+local REFRESH_GROUND_INTERVAL  = 0.6
+local MAX_RENDER_DISTANCE      = 400
+local MAX_RENDER_DISTANCE_SQR  = MAX_RENDER_DISTANCE * MAX_RENDER_DISTANCE
+
+-- Precomputed rain direction (constant; per-drop speed applied as a scalar)
+local RAIN_DIRECTION = Vector3.new(
+    math.tan(math.rad(RAIN_ANGLE_X)),
+    -1,
+    math.tan(math.rad(RAIN_ANGLE_Z))
+).Unit
+local RAIN_OFFSET = RAIN_DIRECTION * RAIN_LENGTH
+
+-- Mode-derived effective values (resolved once at script load)
+local EFFECTIVE_RAIN_COUNT = (Mode == "Thunder") and (RAIN_COUNT * THUNDER_COUNT_MULT) or RAIN_COUNT
+local EFFECTIVE_SPEED_MULT = (Mode == "Thunder") and THUNDER_SPEED_MULT or 1.0
+
+-- ============================================================
+-- Forward declarations
+-- ============================================================
+local drops             = {}
+local s_flakes          = {}
+local activeBolts       = {}
+local nextBoltTimer     = 0
+local flashSquare       = nil
+local flashAge          = -1
+local lastCharacter     = nil
+local cleanupConnection
+
+-- ============================================================
+-- Drawing object pool (Line / Circle / Triangle)
+-- ============================================================
+local LinePool    = {}
+local CirclePool  = {}
+local TriPool     = {}
+local activeLines   = 0
+local activeCircles = 0
+local activeTris    = 0
+
+local function getLine()
+    activeLines = activeLines + 1
+    local l = LinePool[activeLines]
+    if not l then
+        l = Drawing.new("Line")
+        LinePool[activeLines] = l
+    end
+    return l
+end
+
+local function getCircle()
+    activeCircles = activeCircles + 1
+    local c = CirclePool[activeCircles]
+    if not c then
+        c = Drawing.new("Circle")
+        c.NumSides = 12
+        CirclePool[activeCircles] = c
+    end
+    return c
+end
+
+local function getTri()
+    activeTris = activeTris + 1
+    local t = TriPool[activeTris]
+    if not t then
+        t = Drawing.new("Triangle")
+        t.Filled = true
+        TriPool[activeTris] = t
+    end
+    return t
+end
+
+local function hideUnused(prevLines, prevCircles, prevTris)
+    for i = activeLines + 1, prevLines do
+        if LinePool[i] then LinePool[i].Visible = false end
+    end
+    for i = activeCircles + 1, prevCircles do
+        if CirclePool[i] then CirclePool[i].Visible = false end
+    end
+    for i = activeTris + 1, prevTris do
+        if TriPool[i] then TriPool[i].Visible = false end
+    end
+end
+
+-- ============================================================
+-- Cleanup (called on reload and on _G.WeatherCleanup)
+-- ============================================================
+_G.WeatherCleanup = function()
+    pcall(function()
+        if cleanupConnection then cleanupConnection:Disconnect() end
+    end)
+    for _, l in ipairs(LinePool)   do pcall(function() l:Remove() end) end
+    for _, c in ipairs(CirclePool) do pcall(function() c:Remove() end) end
+    for _, t in ipairs(TriPool)    do pcall(function() t:Remove() end) end
+    for _, d in ipairs(drops) do
+        if d.Line then pcall(function() d.Line:Remove() end) end
+    end
+    if flashSquare then pcall(function() flashSquare:Remove() end) end
+    LinePool    = {}
+    CirclePool  = {}
+    TriPool     = {}
+    drops       = {}
+    s_flakes    = {}
+    activeBolts = {}
+    flashSquare = nil
+    flashAge    = -1
+end
+
+-- ============================================================
+-- Reusable RaycastParams
+-- ============================================================
+local occlusionParams = RaycastParams.new()
+occlusionParams.FilterType = Enum.RaycastFilterType.Exclude
+occlusionParams.FilterDescendantsInstances = {}
+occlusionParams.IgnoreWater = true
+
+local groundParams = RaycastParams.new()
+groundParams.FilterType = Enum.RaycastFilterType.Exclude
+groundParams.FilterDescendantsInstances = {}
+groundParams.IgnoreWater = true
+
+-- ============================================================
+-- Helpers
+-- ============================================================
+local function randf(lo, hi)
+    return lo + math.random() * (hi - lo)
+end
+
+local function getPlayerPos()
+    local char = player.Character
+    if not char then return nil end
+    local hrp = char:FindFirstChild("HumanoidRootPart")
+        or char:FindFirstChild("Torso")
+        or char:FindFirstChild("UpperTorso")
+    if hrp and typeof(hrp.Position) == "Vector3" then
+        return hrp.Position
+    end
+    local cam = Workspace.CurrentCamera
+    if cam and typeof(cam.Position) == "Vector3" then
+        return cam.Position
+    end
+    return nil
+end
+
+local function getGround(x, z, baseY)
+    return Workspace:Raycast(
+        Vector3.new(x, baseY + 500, z),
+        Vector3.new(0, -2000, 0),
+        groundParams
+    )
+end
+
+local function isOccluded(target, camera)
+    local origin    = camera.CFrame.Position
+    local direction = target - origin
+    local mag       = direction.Magnitude
+    if mag <= 0 then return false end
+
+    local hit = Workspace:Raycast(origin, direction, occlusionParams)
+    if not hit then return false end
+
+    return (hit.Position - origin).Magnitude < mag - 0.1
+end
+
+-- ============================================================
+-- Colors
+-- ============================================================
+local COL_SNOW_ARM  = Color3.fromRGB(200, 220, 255)
+local COL_SNOW_CORE = Color3.fromRGB(255, 255, 255)
+local COL_SNOW_LAND = Color3.fromRGB(210, 228, 255)
+local COL_RAIN      = Color3.fromRGB(140, 145, 220)
+local COL_SPLASH    = Color3.fromRGB(170, 195, 240)
+local COL_BOLT_CORE = Color3.fromRGB(255, 255, 255)
+
+local PI3 = math.pi / 3.0
+
+-- ============================================================
+-- Drawing helpers
+-- ============================================================
+
+-- Flat filled ellipse drawn in screen space (used for landed snow)
+local function drawFilledGroundEllipse(cx, cy, rx, ry, col, transparency)
+    local pTop   = Vector2.new(cx, cy - ry)
+    local pBot   = Vector2.new(cx, cy + ry)
+    local pLeft  = Vector2.new(cx - rx, cy)
+    local pRight = Vector2.new(cx + rx, cy)
+
+    local t1 = getTri()
+    t1.PointA = pLeft
+    t1.PointB = pTop
+    t1.PointC = pRight
+    t1.Color = col
+    t1.Transparency = transparency
+    t1.Visible = true
+
+    local t2 = getTri()
+    t2.PointA = pLeft
+    t2.PointB = pBot
+    t2.PointC = pRight
+    t2.Color = col
+    t2.Transparency = transparency
+    t2.Visible = true
+end
+
+-- Six-arm snowflake shape with side branches and a bright core
+local function drawSnowflakeShape(cx, cy, r, angle, alpha)
+    -- 3 diameter lines form all 6 main arms in half the draw calls
+    for i = 0, 2 do
+        local a = angle + i * PI3
+        local ca, sa = math.cos(a), math.sin(a)
+        local l = getLine()
+        l.From = Vector2.new(cx - ca * r, cy - sa * r)
+        l.To   = Vector2.new(cx + ca * r, cy + sa * r)
+        l.Color = COL_SNOW_ARM
+        l.Transparency = alpha * 0.86
+        l.Thickness = 1
+        l.Visible = true
+    end
+
+    -- Side branches on all 6 arms (only when close enough to see detail)
+    if r > 4.5 then
+        local bl = r * 0.42
+        for i = 0, 5 do
+            local a = angle + i * PI3
+            local ca, sa = math.cos(a), math.sin(a)
+            local bx = cx + ca * r * 0.55
+            local by = cy + sa * r * 0.55
+
+            for b = -1, 1, 2 do
+                local ba = a + b * PI3
+                local br = getLine()
+                br.From = Vector2.new(bx, by)
+                br.To   = Vector2.new(bx + math.cos(ba) * bl, by + math.sin(ba) * bl)
+                br.Color = COL_SNOW_ARM
+                br.Transparency = alpha * 0.86
+                br.Thickness = 1
+                br.Visible = true
+            end
+        end
+    end
+
+    local core = getCircle()
+    core.Position = Vector2.new(cx, cy)
+    core.Radius = math.max(1.0, r * 0.22)
+    core.Color = COL_SNOW_CORE
+    core.Transparency = alpha
+    core.Thickness = 1
+    core.Visible = true
+end
+
+-- One bolt segment drawn as a thick colored glow + a thin bright white core.
+-- Per-segment occlusion so a bolt partially hidden behind geometry clips correctly.
+local function drawBoltSegment(p1, p2, color, coreThick, glowThick, alpha, camera)
+    local s1, v1 = WorldToScreen(p1)
+    local s2, v2 = WorldToScreen(p2)
+    if not (v1 and v2) then return end
+
+    local mid = (p1 + p2) * 0.5
+    if isOccluded(mid, camera) then return end
+
+    local glow = getLine()
+    glow.From = s1
+    glow.To   = s2
+    glow.Color = color
+    glow.Transparency = 1 - alpha * 0.6
+    glow.Thickness = glowThick
+    glow.Visible = true
+
+    local core = getLine()
+    core.From = s1
+    core.To   = s2
+    core.Color = COL_BOLT_CORE
+    core.Transparency = 1 - alpha
+    core.Thickness = coreThick
+    core.Visible = true
+end
+
+-- ============================================================
+-- Snow system (raycasted collision, same approach as rain)
+-- ============================================================
+local function createFlake()
+    return {
+        Position      = nil,
+        GroundY       = nil,
+        SpeedMul      = randf(0.7, 1.3),
+        DriftX        = randf(-SNOW_DRIFT, SNOW_DRIFT),
+        DriftZ        = randf(-SNOW_DRIFT, SNOW_DRIFT),
+        Spin          = randf(0, math.pi * 2),
+        SpinVel       = randf(0.8, 2.8) * (math.random() > 0.5 and 1 or -1),
+        Size          = randf(0.14, 0.40),
+        Landed        = false,
+        LandTimer     = 0,
+        LandDuration  = 0,
+        CachedOccluded = false,
+        OcclusionTimer = math.random() * SNOW_OCCLUSION_INTERVAL,
+        GroundRefreshTimer = math.random() * REFRESH_GROUND_INTERVAL,
+    }
+end
+
+local function spawnFlake(f)
+    local character = player.Character
+    local root = character and character:FindFirstChild("HumanoidRootPart")
+    if not root then return end
+
+    local center = root.Position
+    local angle  = math.random() * math.pi * 2
+    local radius = math.sqrt(math.random()) * SNOW_RADIUS
+
+    local x = center.X + math.cos(angle) * radius
+    local z = center.Z + math.sin(angle) * radius
+
+    local ground  = getGround(x, z, center.Y)
+    local groundY = ground and ground.Position.Y or center.Y
+
+    f.Position      = Vector3.new(x, groundY + randf(SNOW_HEIGHT_MIN, SNOW_HEIGHT_MAX), z)
+    f.GroundY       = groundY
+    f.SpeedMul      = randf(0.7, 1.3)
+    f.DriftX        = randf(-SNOW_DRIFT, SNOW_DRIFT)
+    f.DriftZ        = randf(-SNOW_DRIFT, SNOW_DRIFT)
+    f.Spin          = randf(0, math.pi * 2)
+    f.SpinVel       = randf(0.8, 2.8) * (math.random() > 0.5 and 1 or -1)
+    f.Size          = randf(0.14, 0.40)
+    f.Landed        = false
+    f.LandTimer     = 0
+    f.LandDuration  = 0
+    f.CachedOccluded = false
+    f.OcclusionTimer = math.random() * SNOW_OCCLUSION_INTERVAL
+    f.GroundRefreshTimer = math.random() * REFRESH_GROUND_INTERVAL
+end
+
+local function tickSnow(dt, camPos, camera)
+    for _, f in ipairs(s_flakes) do
+        if not f.Position then
+            spawnFlake(f)
+        else
+            -- ===== Movement =====
+            if not f.Landed then
+                local movement = Vector3.new(
+                    f.DriftX * dt,
+                    -SNOW_SPEED * f.SpeedMul * dt,
+                    f.DriftZ * dt
+                )
+
+                local aboveGround = f.GroundY
+                    and (f.Position.Y - f.GroundY) > GROUND_CHECK_THRESHOLD
+
+                if aboveGround then
+                    -- Fast path: skip collision raycast while high above ground
+                    f.Position = f.Position + movement
+                    f.Spin = f.Spin + f.SpinVel * dt
+
+                    f.GroundRefreshTimer = f.GroundRefreshTimer - dt
+                    if f.GroundRefreshTimer <= 0 then
+                        f.GroundRefreshTimer = REFRESH_GROUND_INTERVAL
+                        local g = getGround(f.Position.X, f.Position.Z, f.Position.Y)
+                        if g then f.GroundY = g.Position.Y end
+                    end
+
+                    if f.Position.Y <= VOID_Y then
+                        spawnFlake(f)
+                    end
+                else
+                    -- Near ground: full collision check
+                    local hit = Workspace:Raycast(f.Position, movement, groundParams)
+                    if hit then
+                        f.Position = hit.Position
+                        f.Landed = true
+                        f.LandDuration = randf(SNOW_LAND_DURATION_MIN, SNOW_LAND_DURATION_MAX)
+                        f.LandTimer = f.LandDuration
+                    else
+                        f.Position = f.Position + movement
+                        f.Spin = f.Spin + f.SpinVel * dt
+                        if f.Position.Y <= VOID_Y then
+                            spawnFlake(f)
+                        end
+                    end
+                end
+            else
+                -- Landed: count down, respawn when expired
+                f.LandTimer = f.LandTimer - dt
+                if f.LandTimer <= 0 then
+                    spawnFlake(f)
+                end
+            end
+
+            -- ===== Render =====
+            local dx = f.Position.X - camPos.X
+            local dy = f.Position.Y - camPos.Y
+            local dz = f.Position.Z - camPos.Z
+            local distSqr = dx*dx + dy*dy + dz*dz
+
+            if distSqr <= MAX_RENDER_DISTANCE_SQR then
+                local dist = math.sqrt(distSqr)
+
+                -- Staggered occlusion test (amortized over frames)
+                f.OcclusionTimer = f.OcclusionTimer - dt
+                if f.OcclusionTimer <= 0 then
+                    f.OcclusionTimer = SNOW_OCCLUSION_INTERVAL
+                    f.CachedOccluded = isOccluded(f.Position, camera)
+                end
+
+                if not f.CachedOccluded then
+                    local sc, onScreen = WorldToScreen(f.Position)
+                    if onScreen then
+                        local screen_r = math.clamp(f.Size * 110.0 / (dist + 0.5), 1.0, 13.0)
+                        local alpha = 1.0 - dist / (SNOW_RADIUS * 0.85)
+                        if alpha > 1.0 then alpha = 1.0 end
+
+                        if f.Landed then
+                            local fade = math.min(1.0, f.LandTimer / 0.6)
+                            alpha = alpha * fade
+                        end
+
+                        if alpha >= 0.02 then
+                            if f.Landed then
+                                local rx = screen_r * 2.2
+                                local ry = math.max(0.5, screen_r * 0.3)
+                                drawFilledGroundEllipse(sc.X, sc.Y, rx, ry, COL_SNOW_LAND, alpha * 0.85)
+                            else
+                                if screen_r > 2.5 then
+                                    drawSnowflakeShape(sc.X, sc.Y, screen_r, f.Spin, alpha)
+                                else
+                                    local c = getCircle()
+                                    c.Position = sc
+                                    c.Radius = screen_r
+                                    c.Color = COL_SNOW_ARM
+                                    c.Transparency = alpha * 0.86
+                                    c.Thickness = 1
+                                    c.Visible = true
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+end
+
+-- ============================================================
+-- Rain system
+-- ============================================================
+local function spawnPosition()
+    local character = player.Character
+    local root = character and character:FindFirstChild("HumanoidRootPart")
+    if not root then return nil, nil end
+
+    local center = root.Position
+    local angle  = math.random() * math.pi * 2
+    local radius = math.sqrt(math.random()) * RAIN_RADIUS
+
+    local x = center.X + math.cos(angle) * radius
+    local z = center.Z + math.sin(angle) * radius
+
+    local ground  = getGround(x, z, center.Y)
+    local groundY = ground and ground.Position.Y or center.Y
+
+    -- Variable spawn height
+    local spawnH = randf(RAIN_HEIGHT_MIN, RAIN_HEIGHT_MAX)
+    return Vector3.new(x, groundY + spawnH, z), groundY
+end
+
+local function createDrop()
+    local line = Drawing.new("Line")
+    line.Color        = COL_RAIN
+    line.Transparency = 0.35
+    line.Thickness    = 1
+    line.Visible      = false
+
+    local pos, groundY = spawnPosition()
+
+    return {
+        Position      = pos,
+        GroundY       = groundY,
+        Line          = line,
+        -- Per-drop variable fall speed
+        SpeedMul      = randf(RAIN_SPEED_MIN, RAIN_SPEED_MAX) / RAIN_BASE_SPEED,
+        SplashAge     = -1,
+        SplashPosition = nil,
+        SplashNormal   = nil,
+        CachedOccluded  = false,
+        OcclusionTimer  = math.random() * OCCLUSION_INTERVAL,
+        GroundRefreshTimer = math.random() * REFRESH_GROUND_INTERVAL,
+    }
+end
+
+local function respawn(drop)
+    drop.Line.Visible = false
+    local pos, groundY = spawnPosition()
+    drop.Position = pos
+    drop.GroundY  = groundY
+    -- New speed multiplier on respawn so each drop lifetime has its own speed
+    drop.SpeedMul = randf(RAIN_SPEED_MIN, RAIN_SPEED_MAX) / RAIN_BASE_SPEED
+end
+
+local function startSplash(drop, hit)
+    if not SPLASH_ENABLED then return end
+    if hit.Normal.Y < 0.5 then return end  -- ignore near-vertical surfaces (walls)
+
+    drop.SplashPosition = hit.Position + hit.Normal * 0.02
+    drop.SplashNormal   = hit.Normal
+    drop.SplashAge      = 0
+end
+
+-- Circular splash projected onto the impact surface (hit normal basis),
+-- drawn as a filled triangle fan + outline ring. Occlusion-tested against
+-- the impact point so the splash no longer shows through walls.
+local function updateSplash(drop, dt, camera)
+    if drop.SplashAge < 0 then return end
+
+    drop.SplashAge = drop.SplashAge + dt
+    local alpha = drop.SplashAge / SPLASH_DURATION
+
+    if alpha >= 1 then
+        drop.SplashAge = -1
+        return
+    end
+
+    -- Occlusion check at the impact point: don't draw splashes the camera
+    -- can't actually see (e.g. rain falling behind a wall)
+    if isOccluded(drop.SplashPosition, camera) then return end
+
+    local normal    = drop.SplashNormal
+    local reference = math.abs(normal.Y) > 0.95
+        and Vector3.new(1, 0, 0)
+        or  Vector3.new(0, 1, 0)
+
+    local right   = normal:Cross(reference).Unit
+    local forward = normal:Cross(right).Unit
+    local radius  = SPLASH_SIZE * alpha
+    local center  = drop.SplashPosition
+
+    local centerScreen, centerVisible = WorldToScreen(center)
+    if not centerVisible then return end
+
+    -- Project ring points onto the surface plane
+    local points = {}
+    for i = 1, SPLASH_SEGMENTS do
+        local ang = (i / SPLASH_SEGMENTS) * math.pi * 2
+        local wp = center
+            + right   * (math.cos(ang) * radius)
+            + forward * (math.sin(ang) * radius)
+        local sp, v = WorldToScreen(wp)
+        points[i] = v and sp or nil
+    end
+
+    local transparency = 0.15 * (1 - alpha)
+
+    -- Filled triangle fan + outline ring (one segment at a time)
+    for i = 1, SPLASH_SEGMENTS do
+        local nxt = i % SPLASH_SEGMENTS + 1
+        local a, b = points[i], points[nxt]
+        if a and b then
+            local t = getTri()
+            t.PointA       = centerScreen
+            t.PointB       = a
+            t.PointC       = b
+            t.Color        = COL_SPLASH
+            t.Transparency = transparency
+            t.Visible      = true
+
+            local l = getLine()
+            l.From = a
+            l.To   = b
+            l.Color = COL_SPLASH
+            l.Transparency = transparency * 0.5
+            l.Thickness = 1
+            l.Visible = true
+        end
+    end
+end
+
+local function tickRain(dt, camPos, camera)
+    -- Update character exclusion filter only when the character reference changes
+    local character = player.Character
+    if character ~= lastCharacter then
+        lastCharacter = character
+        if character then
+            occlusionParams.FilterDescendantsInstances = {character}
+            groundParams.FilterDescendantsInstances    = {character}
+        else
+            occlusionParams.FilterDescendantsInstances = {}
+            groundParams.FilterDescendantsInstances    = {}
+        end
+    end
+
+    for _, drop in ipairs(drops) do
+        if not drop.Position then
+            -- Retry spawn (root not ready on first frame, etc.)
+            local pos, gy = spawnPosition()
+            drop.Position = pos
+            drop.GroundY  = gy
+            drop.Line.Visible = false
+        else
+            local dx = drop.Position.X - camPos.X
+            local dy = drop.Position.Y - camPos.Y
+            local dz = drop.Position.Z - camPos.Z
+            local distSqr = dx*dx + dy*dy + dz*dz
+
+            -- Per-drop variable fall speed, scaled by mode multiplier
+            local movement = RAIN_DIRECTION * (RAIN_BASE_SPEED * drop.SpeedMul * EFFECTIVE_SPEED_MULT * dt)
+
+            local aboveGround = drop.GroundY
+                and (drop.Position.Y - drop.GroundY) > GROUND_CHECK_THRESHOLD
+
+            if aboveGround then
+                -- Fast path: skip collision raycast while high above ground
+                drop.Position = drop.Position + movement
+
+                drop.GroundRefreshTimer = drop.GroundRefreshTimer - dt
+                if drop.GroundRefreshTimer <= 0 then
+                    drop.GroundRefreshTimer = REFRESH_GROUND_INTERVAL
+                    local g = getGround(drop.Position.X, drop.Position.Z, drop.Position.Y)
+                    if g then drop.GroundY = g.Position.Y end
+                end
+
+                if drop.Position.Y <= VOID_Y then
+                    respawn(drop)
+                end
+            else
+                -- Near ground: full collision check (character excluded via groundParams)
+                local hit = Workspace:Raycast(drop.Position, movement, groundParams)
+                if hit then
+                    startSplash(drop, hit)
+                    respawn(drop)
+                else
+                    drop.Position = drop.Position + movement
+                    if drop.Position.Y <= VOID_Y then
+                        respawn(drop)
+                    end
+                end
+            end
+
+            -- ===== Render streak =====
+            if distSqr <= MAX_RENDER_DISTANCE_SQR then
+                local top    = drop.Position
+                local bottom = top + RAIN_OFFSET
+
+                local topPos,    topVisible    = WorldToScreen(top)
+                local bottomPos, bottomVisible = WorldToScreen(bottom)
+
+                if topVisible and bottomVisible then
+                    -- Staggered occlusion test (amortized over frames)
+                    drop.OcclusionTimer = drop.OcclusionTimer - dt
+                    if drop.OcclusionTimer <= 0 then
+                        drop.OcclusionTimer = OCCLUSION_INTERVAL
+                        drop.CachedOccluded =
+                            isOccluded((top + bottom) * 0.5, camera)
+                    end
+
+                    if not drop.CachedOccluded then
+                        drop.Line.From    = topPos
+                        drop.Line.To      = bottomPos
+                        drop.Line.Visible = true
+                    else
+                        drop.Line.Visible = false
+                    end
+                else
+                    drop.Line.Visible = false
+                end
+            else
+                drop.Line.Visible = false
+            end
+        end
+
+        -- Splash tick (cheap early-out if inactive)
+        updateSplash(drop, dt, camera)
+    end
+end
+
+-- ============================================================
+-- Thunder system
+-- ============================================================
+
+-- Build a jagged polyline from startPos to endPos with `segments` intermediate
+-- points, each offset perpendicular to the main direction by up to `jitter`.
+local function generateJaggedPath(startPos, endPos, segments, jitter)
+    local points = table.create(segments + 1)
+    points[1] = startPos
+    points[segments + 1] = endPos
+
+    local step = (endPos - startPos) / segments
+
+    for i = 1, segments - 1 do
+        local basePos = startPos + step * i
+        local jx = randf(-jitter, jitter)
+        local jy = randf(-jitter * 0.3, jitter * 0.3)
+        local jz = randf(-jitter, jitter)
+        points[i + 1] = basePos + Vector3.new(jx, jy, jz)
+    end
+
+    return points
+end
+
+-- Spawn a single thunderbolt with a random jagged main path and 0..N branches.
+-- Each bolt gets its own color, thickness and per-bolt fade durations so no
+-- two strikes look identical.
+local function spawnBolt(playerPos)
+    -- Main bolt path: from sky above the player to ground near the player
+    local angle = math.random() * math.pi * 2
+    local dist  = math.random() * THUNDER_BOLT_RADIUS
+    local startX = playerPos.X + math.cos(angle) * dist
+    local startZ = playerPos.Z + math.sin(angle) * dist
+    local startY = playerPos.Y + THUNDER_BOLT_HEIGHT
+
+    local endX = startX + randf(-15, 15)
+    local endZ = startZ + randf(-15, 15)
+    local endY = playerPos.Y
+
+    -- Find the actual ground at the end point
+    local ground = getGround(endX, endZ, startY)
+    if ground then
+        endY = ground.Position.Y
+    end
+
+    local startPos = Vector3.new(startX, startY, startZ)
+    local endPos   = Vector3.new(endX, endY, endZ)
+
+    local segments = THUNDER_BOLT_SEGMENTS + math.random(-2, 4)
+    if segments < 6 then segments = 6 end
+    local jitter = THUNDER_BOLT_JITTER * randf(0.7, 1.4)
+
+    local mainPath = generateJaggedPath(startPos, endPos, segments, jitter)
+
+    -- Branches: short jagged offshoots from random points along the main path
+    local branches = {}
+    if math.random() < THUNDER_BOLT_BRANCH_CHANCE then
+        local branchCount = math.random(1, THUNDER_BOLT_MAX_BRANCHES)
+        for b = 1, branchCount do
+            -- Pick a starting point along the main path (30%-80% down)
+            local lo = math.max(2, math.floor(segments * 0.3))
+            local hi = math.min(segments - 1, math.floor(segments * 0.8))
+            if hi < lo then hi = lo end
+            local idx = math.random(lo, hi)
+            local branchStart = mainPath[idx]
+
+            -- Random mostly-horizontal direction with a slight downward bias
+            local bAngle = math.random() * math.pi * 2
+            local bLen   = randf(20, 50)
+            local bDir   = Vector3.new(math.cos(bAngle), -0.3, math.sin(bAngle)).Unit
+            local branchEnd = branchStart + bDir * bLen
+
+            -- Don't let the branch dip below the ground at its end
+            local bGround = getGround(branchEnd.X, branchEnd.Z, branchStart.Y + 50)
+            if bGround and bGround.Position.Y < branchEnd.Y then
+                branchEnd = Vector3.new(branchEnd.X, bGround.Position.Y, branchEnd.Z)
+            end
+
+            local bSegs = math.random(3, 7)
+            local bJit  = jitter * 0.7
+            branches[#branches + 1] = generateJaggedPath(branchStart, branchEnd, bSegs, bJit)
+        end
+    end
+
+    -- Per-bolt variation in color, thickness and fade timing
+    local fadeIn  = THUNDER_BOLT_FADE_IN  * randf(0.8, 1.2)
+    local fadeOut = THUNDER_BOLT_FADE_OUT * randf(0.8, 1.2)
+
+    return {
+        mainPath       = mainPath,
+        branches       = branches,
+        age            = 0,
+        fadeIn         = fadeIn,
+        fadeOut        = fadeOut,
+        totalLife      = fadeIn + fadeOut,
+        color          = Color3.fromRGB(220 + math.random(0, 35), 230 + math.random(0, 25), 255),
+        coreThickness  = math.random(1, 2) + 1,   -- 2..3
+        glowThickness  = math.random(3, 6),
+    }
+end
+
+local function drawBolt(bolt, dt, camera)
+    bolt.age = bolt.age + dt
+
+    -- Smooth alpha curve: very fast easeOutCubic fade-in, then easeInQuad fade-out
+    local alpha
+    if bolt.age < bolt.fadeIn then
+        local t = bolt.age / bolt.fadeIn
+        alpha = 1 - (1 - t) ^ 3
+    elseif bolt.age < bolt.totalLife then
+        local t = (bolt.age - bolt.fadeIn) / bolt.fadeOut
+        local remaining = 1 - t
+        alpha = remaining * remaining
+    else
+        return false  -- expired
+    end
+
+    -- Main path
+    for i = 1, #bolt.mainPath - 1 do
+        drawBoltSegment(bolt.mainPath[i], bolt.mainPath[i + 1],
+            bolt.color, bolt.coreThickness, bolt.glowThickness, alpha, camera)
+    end
+
+    -- Branches (slightly dimmer, thinner)
+    local branchAlpha = alpha * 0.7
+    local bCore = math.max(1, bolt.coreThickness - 1)
+    local bGlow = math.max(2, bolt.glowThickness - 1)
+    for _, branch in ipairs(bolt.branches) do
+        for i = 1, #branch - 1 do
+            drawBoltSegment(branch[i], branch[i + 1],
+                bolt.color, bCore, bGlow, branchAlpha, camera)
+        end
+    end
+
+    return true
+end
+
+-- Screen flash effect (triggered when a bolt spawns)
+local function triggerFlash()
+    if not THUNDER_FLASH_ENABLED then return end
+    if not flashSquare then
+        flashSquare = Drawing.new("Square")
+        flashSquare.Filled = true
+        flashSquare.Color = Color3.fromRGB(255, 255, 255)
+        flashSquare.Transparency = 1
+        flashSquare.Visible = false
+    end
+    flashAge = 0
+end
+
+local function updateFlash(dt, viewportSize)
+    if flashAge < 0 then return end
+    flashAge = flashAge + dt
+    if flashAge >= THUNDER_FLASH_DURATION then
+        flashSquare.Visible = false
+        flashAge = -1
+        return
+    end
+    local t = flashAge / THUNDER_FLASH_DURATION
+    -- Brightest at strike time, fades to 0 over the duration
+    local alpha = (1 - t) * THUNDER_FLASH_MAX_ALPHA
+    flashSquare.Size       = viewportSize
+    flashSquare.Position   = Vector2.new(0, 0)
+    flashSquare.Transparency = 1 - alpha
+    flashSquare.Visible    = true
+end
+
+local function tickThunder(dt, camPos, camera)
+    -- Rain uses the same tick as plain rain (mode multiplier is already baked in)
+    tickRain(dt, camPos, camera)
+
+    -- Bolt spawn timer
+    nextBoltTimer = nextBoltTimer - dt
+    if nextBoltTimer <= 0 then
+        local playerPos = getPlayerPos()
+        if playerPos then
+            activeBolts[#activeBolts + 1] = spawnBolt(playerPos)
+            triggerFlash()
+        end
+        nextBoltTimer = randf(THUNDER_BOLT_MIN_INTERVAL, THUNDER_BOLT_MAX_INTERVAL)
+    end
+
+    -- Update + draw active bolts; remove expired ones
+    for i = #activeBolts, 1, -1 do
+        local alive = drawBolt(activeBolts[i], dt, camera)
+        if not alive then
+            table.remove(activeBolts, i)
+        end
+    end
+
+    -- Screen flash
+    updateFlash(dt, camera.ViewportSize)
+end
+
+-- ============================================================
+-- Initialize
+-- ============================================================
+nextBoltTimer = randf(THUNDER_BOLT_MIN_INTERVAL, THUNDER_BOLT_MAX_INTERVAL)
+
+if Mode == "Rain" or Mode == "Thunder" then
+    for i = 1, EFFECTIVE_RAIN_COUNT do
+        drops[i] = createDrop()
+    end
+elseif Mode == "Snow" then
+    for i = 1, SNOW_COUNT do
+        s_flakes[i] = createFlake()
+    end
+end
+
+-- ============================================================
+-- Main loop
+-- ============================================================
+cleanupConnection = RunService.RenderStepped:Connect(function(dt)
+    local camera = Workspace.CurrentCamera
+    if not camera then return end
+
+    local prevLines   = activeLines
+    local prevCircles = activeCircles
+    local prevTris    = activeTris
+    activeLines   = 0
+    activeCircles = 0
+    activeTris    = 0
+
+    local camPos = camera.CFrame.Position
+    local clampedDt = math.min(dt or 0.016, 0.1)
+
+    if Mode == "Snow" then
+        tickSnow(clampedDt, camPos, camera)
+    elseif Mode == "Thunder" then
+        tickThunder(clampedDt, camPos, camera)
+    else
+        tickRain(clampedDt, camPos, camera)
+    end
+
+    hideUnused(prevLines, prevCircles, prevTris)
+end)
